@@ -51,13 +51,15 @@ class BotEngine:
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
 
-    async def start(self) -> None:
+    async def start(self) -> str | None:
+        """Start the engine. Returns None on success, an error string on failure."""
         if self.is_running():
-            return
+            return None
         self._stop.clear()
         if not config.BINOMO_EMAIL or not config.BINOMO_PASSWORD:
-            db_log("ERROR", "BINOMO_EMAIL / BINOMO_PASSWORD not set in .env")
-            return
+            msg = "BINOMO_EMAIL / BINOMO_PASSWORD not set"
+            db_log("ERROR", msg)
+            return msg
         self.client = BinomoClient(
             email=config.BINOMO_EMAIL,
             password=config.BINOMO_PASSWORD,
@@ -66,13 +68,15 @@ class BotEngine:
         try:
             await self.client.connect()
         except Exception as e:
-            db_log("ERROR", f"Binomo connect failed: {e}")
+            msg = f"Binomo connect failed: {e}"
+            db_log("ERROR", msg)
             self.client = None
-            return
+            return msg
         self._reset_orphan_running()
         kv_set("engine_state", "running")
         db_log("INFO", f"Engine started (account={config.ACCOUNT_TYPE}, asset={config.ASSET})")
         self._task = asyncio.create_task(self._loop())
+        return None
 
     def _reset_orphan_running(self) -> None:
         """On (re)start, any row left in 'running' is from a previous session;

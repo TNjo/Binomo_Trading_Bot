@@ -809,7 +809,14 @@ $("#btn-clear-all").addEventListener("click", async () => {
 
 $("#btn-start").addEventListener("click", async () => {
   $("#btn-start").disabled = true;
-  await api("/api/engine/start", { method: "POST" });
+  try {
+    const r = await api("/api/engine/start", { method: "POST" });
+    if (!r.running && r.error) {
+      alert("Engine did not start:\n\n" + r.error + "\n\nSee the Activity Log or deployment logs for more detail.");
+    }
+  } catch (e) {
+    alert("Start request failed: " + e.message);
+  }
   refresh();
 });
 $("#btn-stop").addEventListener("click", async () => {

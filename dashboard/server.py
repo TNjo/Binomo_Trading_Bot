@@ -147,8 +147,8 @@ def api_save_settings(payload: dict, _: str = Depends(_auth)):
 
 @app.post("/api/engine/start")
 async def api_engine_start(_: str = Depends(_auth)):
-    await engine.start()
-    return {"running": engine.is_running()}
+    error = await engine.start()
+    return {"running": engine.is_running(), "error": error}
 
 
 @app.post("/api/engine/stop")

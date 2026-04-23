@@ -147,7 +147,16 @@ def api_save_settings(payload: dict, _: str = Depends(_auth)):
 
 @app.post("/api/engine/start")
 async def api_engine_start(_: str = Depends(_auth)):
-    error = await engine.start()
+    try:
+        error = await engine.start()
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc().splitlines()
+        brief = f"{type(e).__name__}: {e}"
+        db_log("ERROR", f"engine.start() raised: {brief}")
+        for line in tb[-6:]:
+            db_log("ERROR", line)
+        return {"running": engine.is_running(), "error": brief}
     return {"running": engine.is_running(), "error": error}
 
 

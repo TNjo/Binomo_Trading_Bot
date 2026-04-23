@@ -57,9 +57,19 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 
 
+def _open(timeout: float = 15.0) -> sqlite3.Connection:
+    """Open a DB connection. `timeout` is the busy-wait in seconds before
+    sqlite3 raises 'database is locked'. WAL mode is set once at init_db()
+    (it persists in the file header) so we don't re-run PRAGMA per open."""
+    conn = sqlite3.connect(str(DB_PATH), timeout=timeout)
+    return conn
+
+
 def init_db() -> None:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=15.0)
     try:
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         with conn:
             conn.executescript(SCHEMA)
             cols = {r[1] for r in conn.execute("PRAGMA table_info(signals)").fetchall()}
@@ -71,7 +81,7 @@ def init_db() -> None:
 
 @contextmanager
 def conn_ctx() -> Iterator[sqlite3.Connection]:
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = _open()
     conn.row_factory = sqlite3.Row
     try:
         yield conn

@@ -86,8 +86,9 @@ class BotEngine:
                 cur = conn.execute(
                     "UPDATE signals SET status='skipped' WHERE status='running'"
                 )
-                if cur.rowcount:
-                    db_log("INFO", f"Reset {cur.rowcount} orphaned running signal(s) to skipped")
+                rowcount = cur.rowcount
+        if rowcount:
+            db_log("INFO", f"Reset {rowcount} orphaned running signal(s) to skipped")
 
     async def stop(self) -> None:
         self._stop.set()

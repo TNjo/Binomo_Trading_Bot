@@ -531,7 +531,10 @@ code { background: var(--bg-2); padding: 1px 6px; border-radius: 4px; font-size:
   <div class="card">
     <div class="card-head">
       <div class="card-title">Signals</div>
-      <span class="hint" id="sig-count">0 total</span>
+      <div style="display:flex; gap:8px; align-items:center;">
+        <button id="btn-export-pdf" class="ghost" type="button">Export PDF</button>
+        <span class="hint" id="sig-count">0 total</span>
+      </div>
     </div>
     <div class="table-wrap">
       <table>
@@ -805,6 +808,37 @@ $("#btn-clear-all").addEventListener("click", async () => {
   if (!confirm("Wipe ALL signals, trades, and logs? (currently running trade is kept)")) return;
   await api("/api/signals/clear_all", { method: "POST" });
   refresh();
+});
+
+$("#btn-export-pdf").addEventListener("click", async () => {
+  const btn = $("#btn-export-pdf");
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Generating…";
+  try {
+    const r = await fetch("/api/signals/export.pdf");
+    if (!r.ok) {
+      const msg = await r.text().catch(() => r.statusText);
+      throw new Error(`${r.status} ${msg}`);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get("content-disposition") || "";
+    const m = cd.match(/filename="?([^"]+)"?/);
+    const fname = m ? m[1] : `binomo_signals_${new Date().toISOString().replace(/[:T]/g, "-").slice(0, 19)}.pdf`;
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  } catch (e) {
+    alert("PDF export failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
 });
 
 $("#btn-start").addEventListener("click", async () => {

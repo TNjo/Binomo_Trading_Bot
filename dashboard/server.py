@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, status
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
@@ -313,6 +313,240 @@ def api_logs(limit: int = 100, _: str = Depends(_auth)):
             "SELECT * FROM logs ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+@app.get("/api/signals/export.pdf")
+def api_signals_export_pdf(_: str = Depends(_auth)):
+    """Render the full signals + trades + summary as a PDF report.
+
+    Includes: total signals loaded, wins/losses/pending, total PnL, win rate,
+    martingale level distribution, current sizing settings, and a per-signal
+    table with each martingale level's stake/result/payout.
+    """
+    from io import BytesIO
+    from zoneinfo import ZoneInfo
+
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.platypus import (
+            SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer,
+        )
+    except ImportError:
+        raise HTTPException(
+            500,
+            "reportlab is not installed — run `pip install reportlab` and restart",
+        )
+
+    settings_now = get_trade_settings()
+    tz = ZoneInfo(config.TIMEZONE)
+    generated_local = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    with conn_ctx() as conn:
+        sig_rows = conn.execute(
+            "SELECT id, signal_time, direction, status, martingale_level, "
+            "won_at_level, total_pnl, starting_amount "
+            "FROM signals ORDER BY signal_time ASC"
+        ).fetchall()
+        trade_rows = conn.execute(
+            "SELECT signal_id, level, amount, result, payout "
+            "FROM trades ORDER BY signal_id ASC, level ASC"
+        ).fetchall()
+
+        total = len(sig_rows)
+        wins = sum(1 for r in sig_rows if r["status"] == "won")
+        losses = sum(1 for r in sig_rows if r["status"] == "lost")
+        pending = sum(1 for r in sig_rows if r["status"] in ("pending", "running"))
+        skipped = sum(1 for r in sig_rows if r["status"] == "skipped")
+        errored = sum(1 for r in sig_rows if r["status"] == "error")
+        total_pnl = sum(float(r["total_pnl"] or 0.0) for r in sig_rows)
+
+        mg_dist = {0: 0, 1: 0, 2: 0}
+        for r in sig_rows:
+            if r["status"] == "won" and r["won_at_level"] is not None:
+                lv = int(r["won_at_level"])
+                mg_dist[lv] = mg_dist.get(lv, 0) + 1
+
+    closed = wins + losses
+    win_rate = round((wins / closed) * 100, 1) if closed else 0.0
+
+    trades_by_sig: dict[int, list[dict]] = {}
+    for t in trade_rows:
+        trades_by_sig.setdefault(int(t["signal_id"]), []).append({
+            "level": int(t["level"]),
+            "amount": float(t["amount"] or 0),
+            "result": t["result"] or "",
+            "payout": float(t["payout"] or 0.0),
+        })
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=landscape(A4),
+        leftMargin=12 * mm, rightMargin=12 * mm,
+        topMargin=12 * mm, bottomMargin=12 * mm,
+        title="Binomo Bot Signals Report",
+    )
+    styles = getSampleStyleSheet()
+    h1 = styles["Heading1"]
+    h2 = styles["Heading2"]
+    body = styles["BodyText"]
+    small = ParagraphStyle("small", parent=body, fontSize=8, leading=10)
+    story: list = []
+
+    story.append(Paragraph("Binomo Signal Bot — Trade Report", h1))
+    story.append(Paragraph(
+        f"Generated: {generated_local} &nbsp;&nbsp; "
+        f"Asset: {config.ASSET} &nbsp;&nbsp; "
+        f"Account: {config.ACCOUNT_TYPE}",
+        small,
+    ))
+    story.append(Spacer(1, 6))
+
+    summary_data = [
+        ["Signals loaded", str(total), "Wins", str(wins)],
+        ["Pending / running", str(pending), "Losses", str(losses)],
+        ["Skipped", str(skipped), "Errors", str(errored)],
+        ["Win rate", f"{win_rate}%", "Total P&L", f"${total_pnl:+.2f}"],
+    ]
+    sum_tbl = Table(summary_data, colWidths=[40 * mm, 35 * mm, 30 * mm, 35 * mm])
+    sum_tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("BACKGROUND", (0, 0), (0, -1), colors.whitesmoke),
+        ("BACKGROUND", (2, 0), (2, -1), colors.whitesmoke),
+        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+        ("FONTNAME", (2, 0), (2, -1), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(sum_tbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Martingale distribution (wins by level)", h2))
+    mg_data = [
+        ["Won at L0 (original)", str(mg_dist.get(0, 0))],
+        ["Won at L1 (after 1 loss)", str(mg_dist.get(1, 0))],
+        ["Won at L2 (after 2 losses)", str(mg_dist.get(2, 0))],
+    ]
+    mg_tbl = Table(mg_data, colWidths=[80 * mm, 30 * mm])
+    mg_tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    story.append(mg_tbl)
+    story.append(Spacer(1, 8))
+
+    story.append(Paragraph("Sizing settings (current)", h2))
+    set_data = [
+        ["Base amount", f"${settings_now['base_amount']:.2f}"],
+        ["Max martingale levels", str(settings_now["max_martingale"])],
+        ["Martingale multiplier", f"x{settings_now['martingale_multiplier']:.2f}"],
+        ["Payout ratio", f"{settings_now['payout_ratio']:.2f}"],
+        ["Loss recovery enabled", "yes" if settings_now["loss_recovery"] else "no"],
+        ["Recovery base", f"${settings_now['recovery_base']:.2f}"],
+    ]
+    set_tbl = Table(set_data, colWidths=[80 * mm, 50 * mm])
+    set_tbl.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+    ]))
+    story.append(set_tbl)
+    story.append(Spacer(1, 10))
+
+    story.append(Paragraph("Per-signal detail", h2))
+
+    detail_header = [
+        "#", "Signal time", "Dir", "Status",
+        "Level reached", "Won at", "L0 stake", "L1 stake", "L2 stake",
+        "L0 res", "L1 res", "L2 res", "P&L",
+    ]
+    detail_rows: list[list[str]] = [detail_header]
+
+    def _stake(trades: list[dict], level: int) -> str:
+        for t in trades:
+            if t["level"] == level:
+                return f"${t['amount']:.2f}"
+        return "—"
+
+    def _res(trades: list[dict], level: int) -> str:
+        for t in trades:
+            if t["level"] == level:
+                r = t["result"] or ""
+                return r[:5]
+        return "—"
+
+    for r in sig_rows:
+        sid = int(r["id"])
+        trades = trades_by_sig.get(sid, [])
+        try:
+            stime = datetime.fromisoformat(r["signal_time"]).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            stime = str(r["signal_time"])
+        won_at = r["won_at_level"]
+        won_at_str = "—" if won_at is None else f"L{int(won_at)}"
+        pnl_val = float(r["total_pnl"] or 0.0)
+        detail_rows.append([
+            str(sid),
+            stime,
+            r["direction"] or "",
+            r["status"] or "",
+            f"L{int(r['martingale_level'] or 0)}",
+            won_at_str,
+            _stake(trades, 0),
+            _stake(trades, 1),
+            _stake(trades, 2),
+            _res(trades, 0),
+            _res(trades, 1),
+            _res(trades, 2),
+            f"{pnl_val:+.2f}",
+        ])
+
+    col_widths = [
+        12 * mm, 32 * mm, 12 * mm, 22 * mm,
+        20 * mm, 16 * mm, 18 * mm, 18 * mm, 18 * mm,
+        16 * mm, 16 * mm, 16 * mm, 18 * mm,
+    ]
+    detail_tbl = Table(detail_rows, colWidths=col_widths, repeatRows=1)
+    style = TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.lightgrey),
+        ("ALIGN", (0, 0), (0, -1), "RIGHT"),
+        ("ALIGN", (6, 0), (12, -1), "RIGHT"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ])
+    for i, r in enumerate(sig_rows, start=1):
+        sstatus = r["status"]
+        pnl_val = float(r["total_pnl"] or 0.0)
+        if sstatus == "won":
+            style.add("BACKGROUND", (3, i), (3, i), colors.HexColor("#1e3a1e"))
+            style.add("TEXTCOLOR", (3, i), (3, i), colors.white)
+        elif sstatus == "lost":
+            style.add("BACKGROUND", (3, i), (3, i), colors.HexColor("#5a1f1f"))
+            style.add("TEXTCOLOR", (3, i), (3, i), colors.white)
+        if pnl_val > 0:
+            style.add("TEXTCOLOR", (12, i), (12, i), colors.HexColor("#1b6e1b"))
+        elif pnl_val < 0:
+            style.add("TEXTCOLOR", (12, i), (12, i), colors.HexColor("#a32020"))
+    detail_tbl.setStyle(style)
+    story.append(detail_tbl)
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+
+    fname = f"binomo_signals_{datetime.now(tz).strftime('%Y%m%d_%H%M%S')}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
 
 
 @app.get("/api/balance")
